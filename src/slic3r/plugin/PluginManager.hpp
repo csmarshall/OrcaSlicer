@@ -113,6 +113,13 @@ struct ScriptCompletion
     bool            cancelled = false;
 };
 
+// Result of ScriptAsyncRuntime::start().
+enum class ScriptStartResult {
+    Started,
+    ShuttingDown,   // the runtime is stopping or the interpreter is not up
+    AlreadyRunning, // the same capability already has a run in flight
+};
+
 // One string bucket of PluginPermissions. Used by PluginPermissionMutation.
 enum class PluginPermissionCategory {
     FsRead,
@@ -300,8 +307,9 @@ public:
     // Outcome of launching a Script capability.
     struct ScriptLaunchResult
     {
-        bool             launched_async = false; // true => a run started off-thread; wait for on_done
-        ScriptCompletion outcome;                // meaningful when !launched_async (start failure only)
+        bool             launched_async  = false; // true => a run started off-thread; wait for on_done
+        bool             already_running = false; // true => refused because this capability is still running; not a failure
+        ScriptCompletion outcome;                 // meaningful when !launched_async (outcome.error also set when already_running)
     };
     // Invoked on the GUI thread when a Script invocation finishes (or inline, on the calling thread,
     // when the run could not be started at all).
@@ -503,8 +511,9 @@ public:
     // whether `def` or `async def`) and its detection both run on that worker, never on the calling
     // thread. `on_done` is invoked on the GUI thread (or inline when there is no wx app) when the
     // invocation finishes; a `cancelled` completion is expected termination from cancel_plugin().
-    // Returns false when the runtime is shutting down.
-    bool start(const std::string& plugin_key,
+    // Returns ShuttingDown when the runtime is stopping, and AlreadyRunning (without starting anything)
+    // when the same capability of the same plugin already has a run in flight.
+    ScriptStartResult start(const std::string& plugin_key,
                const std::string& capability_name,
                std::shared_ptr<PluginCapabilityInterface> capability,
                std::function<void(const ScriptCompletion&)> on_done);
@@ -512,6 +521,9 @@ public:
     // Requests cancellation of every active run owned by plugin_key: marks the run and cancels
     // its asyncio task via loop.call_soon_threadsafe (a synchronous invocation has no loop).
     void cancel_plugin(const std::string& plugin_key);
+
+    // Same as cancel_plugin(), limited to the runs of one capability of that plugin.
+    void cancel_capability(const std::string& plugin_key, const std::string& capability_name);
 
     // True while a run for `capability` is active.
     bool has_active_run(const PluginCapabilityInterface* capability) const;
@@ -530,6 +542,8 @@ public:
 
 private:
     ScriptAsyncRuntime();
+    // capability_name == nullptr selects every run of plugin_key.
+    void cancel_runs(const std::string& plugin_key, const std::string* capability_name);
     struct Impl;
     std::unique_ptr<Impl> m_impl;
 };

@@ -840,6 +840,20 @@ void PluginManager::release_load_slot(const std::string& plugin_key)
     notify_plugin_load_state_changed(changed);
 }
 
+// Tells the plugin its capability is being cancelled. A failing plugin must not stop the caller.
+static void notify_capability_cancelled(PluginCapabilityInterface& capability)
+{
+    try {
+        capability.on_cancelled();
+    } catch (const std::exception& ex) {
+        BOOST_LOG_TRIVIAL(warning) << "Plugin on_cancelled failed for '" << capability.audit_plugin_key() << "/"
+                                   << capability.name() << "': " << ex.what();
+    } catch (...) {
+        BOOST_LOG_TRIVIAL(warning) << "Plugin on_cancelled failed for '" << capability.audit_plugin_key() << "/"
+                                   << capability.name() << "'";
+    }
+}
+
 void PluginManager::cancel_and_wait_for_capabilities(
     const std::vector<std::shared_ptr<PluginCapabilityInterface>>& capabilities)
 {
@@ -851,15 +865,7 @@ void PluginManager::cancel_and_wait_for_capabilities(
         if (!capability || !capability->is_enabled())
             continue;
 
-        try {
-            capability->on_cancelled();
-        } catch (const std::exception& ex) {
-            BOOST_LOG_TRIVIAL(warning) << "Plugin on_cancelled failed for '" << capability->audit_plugin_key() << "/"
-                                       << capability->name() << "': " << ex.what();
-        } catch (...) {
-            BOOST_LOG_TRIVIAL(warning) << "Plugin on_cancelled failed for '" << capability->audit_plugin_key() << "/"
-                                       << capability->name() << "'";
-        }
+        notify_capability_cancelled(*capability);
     }
 
     for (const auto& capability : capabilities) {
@@ -1270,6 +1276,7 @@ void PluginManager::set_capability_enabled(const PluginCapabilityId& id, bool en
 {
     PluginCapabilityId changed;
     bool did_change = false;
+    std::shared_ptr<PluginCapabilityInterface> disabled_script;
 
     {
         std::lock_guard<std::mutex> lock(m_mutex);
@@ -1287,6 +1294,8 @@ void PluginManager::set_capability_enabled(const PluginCapabilityId& id, bool en
             capability->set_enabled(enabled);
             changed    = capability->identity();
             did_change = true;
+            if (!enabled && capability->type() == PluginCapabilityType::Script)
+                disabled_script = capability;
             break;
         }
     }
@@ -1300,6 +1309,13 @@ void PluginManager::set_capability_enabled(const PluginCapabilityId& id, bool en
         run_on_capability_load_callbacks(changed);
     else
         run_on_capability_unload_callbacks(changed);
+
+    // A disabled Script capability must stop what it started. Unload skips disabled capabilities, so
+    // this is the only point where the plugin hears about it. Runs plugin code, so never under m_mutex.
+    if (disabled_script) {
+        notify_capability_cancelled(*disabled_script);
+        ScriptAsyncRuntime::instance().cancel_capability(id.plugin_key, disabled_script->name());
+    }
 }
 
 void PluginManager::write_loaded_plugin_install_state(const std::string& plugin_key)
@@ -2890,13 +2906,13 @@ ScriptAsyncRuntime::ScriptAsyncRuntime() : m_impl(std::make_unique<Impl>()) {}
 
 ScriptAsyncRuntime::~ScriptAsyncRuntime() { shutdown(); }
 
-bool ScriptAsyncRuntime::start(const std::string& plugin_key,
-                               const std::string& capability_name,
-                               std::shared_ptr<PluginCapabilityInterface> capability,
-                               std::function<void(const ScriptCompletion&)> on_done)
+ScriptStartResult ScriptAsyncRuntime::start(const std::string& plugin_key,
+                                            const std::string& capability_name,
+                                            std::shared_ptr<PluginCapabilityInterface> capability,
+                                            std::function<void(const ScriptCompletion&)> on_done)
 {
     if (!PythonInterpreter::instance().is_initialized())
-        return false;
+        return ScriptStartResult::ShuttingDown;
 
     auto run             = std::make_shared<Impl::Run>();
     run->plugin_key      = plugin_key;
@@ -2907,7 +2923,11 @@ bool ScriptAsyncRuntime::start(const std::string& plugin_key,
     {
         std::lock_guard<std::mutex> lock(m_impl->mutex);
         if (m_impl->stopping)
-            return false;
+            return ScriptStartResult::ShuttingDown;
+        // Checked under the lock that guards the push, so two quick launches cannot both pass.
+        for (const auto& active_run : m_impl->active)
+            if (active_run->plugin_key == plugin_key && active_run->capability_name == capability_name)
+                return ScriptStartResult::AlreadyRunning;
         m_impl->active.push_back(run);
     }
 
@@ -2921,18 +2941,28 @@ bool ScriptAsyncRuntime::start(const std::string& plugin_key,
     } catch (...) {
         std::lock_guard<std::mutex> lock(m_impl->mutex);
         m_impl->active.erase(std::remove(m_impl->active.begin(), m_impl->active.end(), run), m_impl->active.end());
-        return false;
+        return ScriptStartResult::ShuttingDown;
     }
-    return true;
+    return ScriptStartResult::Started;
 }
 
 void ScriptAsyncRuntime::cancel_plugin(const std::string& plugin_key)
+{
+    cancel_runs(plugin_key, nullptr);
+}
+
+void ScriptAsyncRuntime::cancel_capability(const std::string& plugin_key, const std::string& capability_name)
+{
+    cancel_runs(plugin_key, &capability_name);
+}
+
+void ScriptAsyncRuntime::cancel_runs(const std::string& plugin_key, const std::string* capability_name)
 {
     std::vector<std::shared_ptr<Impl::Run>> runs;
     {
         std::lock_guard<std::mutex> lock(m_impl->mutex);
         for (const auto& run : m_impl->active)
-            if (run->plugin_key == plugin_key)
+            if (run->plugin_key == plugin_key && (capability_name == nullptr || run->capability_name == *capability_name))
                 runs.push_back(run);
     }
 
@@ -3068,7 +3098,7 @@ PluginManager::ScriptLaunchResult PluginManager::launch_script_capability(const 
     // a synchronous `def execute` — is handed to the runtime, which runs it on its own worker and
     // reports the outcome through the completion callback. Nothing executes before returning here,
     // so the UI thread is never blocked by a Script invocation.
-    const bool started = ScriptAsyncRuntime::instance().start(
+    const ScriptStartResult started = ScriptAsyncRuntime::instance().start(
         plugin_key, capability_name, cap,
         [this, plugin_key, on_done](const ScriptCompletion& completion) {
             // A cancellation requested by cancel_plugin() (unload/shutdown) is expected termination:
@@ -3079,7 +3109,15 @@ PluginManager::ScriptLaunchResult PluginManager::launch_script_capability(const 
                 on_done(completion);
         });
 
-    if (!started) {
+    // A second press of run while the first is still going is not a plugin failure: report it without
+    // recording an error, which would make the caller unload the plugin and end the first run.
+    if (started == ScriptStartResult::AlreadyRunning) {
+        launch.already_running = true;
+        launch.outcome.error   = _u8L("This script is already running.");
+        return launch;
+    }
+
+    if (started != ScriptStartResult::Started) {
         launch.outcome.error = _u8L("Plugin system is shutting down.");
         set_plugin_error(plugin_key, launch.outcome.error);
         BOOST_LOG_TRIVIAL(error) << "Script plugin execution failed. plugin_key=" << plugin_key
