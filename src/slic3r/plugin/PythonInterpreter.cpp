@@ -358,8 +358,8 @@ void restore_python_stream(PyObject* sys, const char* name)
     Py_DECREF(original);
 }
 
-// Tee Python sys.stderr to <data_dir>/log/python_*.log so plugin errors are
-// persisted. Uncaught exceptions in plugin-spawned threads never cross the
+// Tee Python sys.stderr and sys.stdout to <data_dir>/log/python_*.log so plugin errors and
+// print() output are persisted. Uncaught exceptions in plugin-spawned threads never cross the
 // pybind11 boundary back into C++ — CPython's default threading.excepthook
 // prints them to sys.stderr and lets the thread die — so capturing stderr is
 // the one place all of them can be observed.
@@ -376,13 +376,30 @@ void install_python_stderr_redirect()
         "import io, os, sys, threading\n"
         "_ORCA_PYTHON_LOG = \"" + log_path + "\"\n"
         + std::string(R"REDIRECT_SCRIPT(
-class _OrcaTeeStderr(io.TextIOBase):
-    def __init__(self, original, path):
+class _OrcaTeeStream(io.TextIOBase):
+    def __init__(self, original, path, lock):
         self._original = original
         self._path = path
-        self._lock = threading.Lock()
+        self._lock = lock
     def writable(self):
         return True
+    # io.TextIOBase has no encoding and its fileno() always raises. Forward them to the original
+    # stream so code that inspects sys.stdout or hands it to subprocess behaves as before.
+    @property
+    def encoding(self):
+        return getattr(self._original, "encoding", None) or "utf-8"
+    @property
+    def errors(self):
+        return getattr(self._original, "errors", None) or "strict"
+    def isatty(self):
+        try:
+            return bool(self._original is not None and self._original.isatty())
+        except Exception:
+            return False
+    def fileno(self):
+        if self._original is None:
+            raise io.UnsupportedOperation("fileno")
+        return self._original.fileno()
     def write(self, s):
         try:
             if self._original is not None:
@@ -403,15 +420,17 @@ class _OrcaTeeStderr(io.TextIOBase):
             pass
 
 os.makedirs(os.path.dirname(_ORCA_PYTHON_LOG), exist_ok=True)
-sys.stderr = _OrcaTeeStderr(sys.__stderr__, _ORCA_PYTHON_LOG)
-del _OrcaTeeStderr
+_orca_log_lock = threading.Lock()
+sys.stderr = _OrcaTeeStream(sys.__stderr__, _ORCA_PYTHON_LOG, _orca_log_lock)
+sys.stdout = _OrcaTeeStream(sys.__stdout__, _ORCA_PYTHON_LOG, _orca_log_lock)
+del _OrcaTeeStream, _orca_log_lock
 )REDIRECT_SCRIPT");
 
     if (PyRun_SimpleString(redirect_script.c_str()) != 0) {
         PyErr_Clear();
-        BOOST_LOG_TRIVIAL(warning) << "Failed to install Python stderr redirect to " << log_path;
+        BOOST_LOG_TRIVIAL(warning) << "Failed to install Python stdout/stderr redirect to " << log_path;
     } else {
-        BOOST_LOG_TRIVIAL(info) << "Python stderr redirected to " << log_path;
+        BOOST_LOG_TRIVIAL(info) << "Python stdout/stderr redirected to " << log_path;
     }
 }
 
