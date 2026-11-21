@@ -226,6 +226,11 @@ unloaded, and that a blocking UI selection cannot mutate presets after teardown.
   Only the non-Script path keeps the historical bounded 2-second grace: when no invocation is active,
   the drain stops waiting for capability references at the grace deadline and logs any remaining
   ones.
+  A synchronous `def execute` cannot be interrupted, so it learns of the request by polling
+  `orca.script.cancel_requested()`, which reads the run's `cancel_requested` flag through a
+  thread-local set for the duration of the invocation. It returns `False` outside an invocation and
+  on threads the plugin starts itself (including `asyncio.to_thread`); an `async def execute`
+  polling it from the coroutine sees the same flag.
 - `PluginManager::shutdown` detaches the libslic3r hooks (`plugin_hooks::uninstall`), stops new
   loads, waits for in-flight loads, unloads every plugin (draining the async runs above), then calls
   `ScriptAsyncRuntime::instance().shutdown()`, which refuses new runs and waits without a deadline

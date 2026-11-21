@@ -528,6 +528,11 @@ public:
     // object when the calling thread is not running one. Must be called with the GIL held.
     static pybind11::object current_loop();
 
+    // True when the Script invocation running on the calling thread has been asked to stop
+    // (unload, shutdown or capability disable). False outside an invocation and on threads the
+    // plugin started itself. Safe to poll from a synchronous `execute`.
+    static bool cancel_requested();
+
 private:
     ScriptAsyncRuntime();
     struct Impl;

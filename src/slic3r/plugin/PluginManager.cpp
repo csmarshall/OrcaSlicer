@@ -2718,6 +2718,11 @@ namespace {
 // always cleared under the GIL before the worker thread exits.
 thread_local PyObject* tl_script_loop = nullptr;
 
+// The cancel flag of the Script invocation running on the calling thread; null on any other
+// thread. Points into the Run, which outlives the invocation, and is cleared before the worker
+// thread leaves run_invocation().
+thread_local const std::atomic<bool>* tl_script_cancel = nullptr;
+
 } // namespace
 
 struct ScriptAsyncRuntime::Impl
@@ -2759,6 +2764,14 @@ void ScriptAsyncRuntime::Impl::run_invocation(const std::shared_ptr<Run>& run)
             completion.error = _u8L("Python interpreter is shutting down.");
         } else {
             pybind11::gil_scoped_acquire gil;
+
+            // Lets a synchronous `execute` poll the request through cancel_requested(); cleared on
+            // every exit path of this scope.
+            struct CancelFlagScope
+            {
+                explicit CancelFlagScope(const std::atomic<bool>& flag) { tl_script_cancel = &flag; }
+                ~CancelFlagScope() { tl_script_cancel = nullptr; }
+            } cancel_flag_scope(run->cancel_requested);
 
             if (run->cancel_requested.load(std::memory_order_acquire)) {
                 // Cancelled before it ran: expected termination, never an error.
@@ -2993,6 +3006,11 @@ void ScriptAsyncRuntime::reset()
 
     std::lock_guard<std::mutex> lock(m_impl->mutex);
     m_impl->stopping = false;
+}
+
+bool ScriptAsyncRuntime::cancel_requested()
+{
+    return tl_script_cancel != nullptr && tl_script_cancel->load(std::memory_order_acquire);
 }
 
 pybind11::object ScriptAsyncRuntime::current_loop()
