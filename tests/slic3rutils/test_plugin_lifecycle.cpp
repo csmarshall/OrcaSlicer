@@ -1,5 +1,6 @@
 #include <boost/filesystem/path.hpp>
 #include <boost/filesystem/operations.hpp>
+#include <boost/filesystem/directory.hpp>
 #include <boost/nowide/convert.hpp>
 #include <boost/nowide/fstream.hpp>
 #include <catch2/catch_all.hpp>
@@ -32,6 +33,7 @@
 #include <condition_variable>
 #include <cstddef>
 #include <fstream>
+#include <iterator>
 #include <mutex>
 #include "slic3r/plugin/PythonPluginInterface.hpp"
 #include <string>
@@ -1599,3 +1601,124 @@ TEST_CASE("SSL_CERT_FILE still overrides the bundled Python's default CA certifi
     CHECK(default_context_ca_count() == 0);
 }
 #endif
+
+namespace {
+
+// Concatenated contents of every python_*.log the interpreter wrote under `data_dir`/log.
+std::string read_python_logs(const fs::path& data_dir)
+{
+    std::string content;
+    const fs::path log_dir = data_dir / "log";
+    if (!fs::is_directory(log_dir))
+        return content;
+    for (fs::directory_iterator it(log_dir), end; it != end; ++it) {
+        const std::string name = it->path().filename().string();
+        if (name.rfind("python_", 0) != 0 || it->path().extension() != ".log")
+            continue;
+        std::ifstream in(it->path().string(), std::ios::binary);
+        content.append(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+    }
+    return content;
+}
+
+size_t count_occurrences(const std::string& haystack, const std::string& needle)
+{
+    size_t n = 0;
+    for (size_t pos = haystack.find(needle); pos != std::string::npos; pos = haystack.find(needle, pos + needle.size()))
+        ++n;
+    return n;
+}
+
+} // namespace
+
+// The interpreter (and so the log path) is fixed at the first initialize(). ctest runs one process
+// per case, so the log lives under this case's data dir; running the whole binary in one process
+// would make a later case look in the wrong directory (same caveat as at the top of this file).
+TEST_CASE("Python stdout from a plugin is written to the python log", "[PluginLifecycle][Python]")
+{
+    ScopedPluginManager plugin_system;
+    if (!plugin_system.initialized)
+        SKIP("Bundled Python interpreter unavailable: " + PythonInterpreter::instance().last_error());
+    pybind11::gil_scoped_acquire gil;
+
+    pybind11::exec("import sys\n"
+                   "print('ORCA_STDOUT_MARKER')\n"
+                   "print('ORCA_STDERR_MARKER', file=sys.stderr)\n");
+
+    const std::string log = read_python_logs(plugin_system.python_data_dir.dir);
+    CHECK(log.find("ORCA_STDOUT_MARKER\n") != std::string::npos);
+    CHECK(log.find("ORCA_STDERR_MARKER\n") != std::string::npos);
+}
+
+TEST_CASE("The Python stdout tee still behaves like the original stream", "[PluginLifecycle][Python]")
+{
+    ScopedPluginManager plugin_system;
+    if (!plugin_system.initialized)
+        SKIP("Bundled Python interpreter unavailable: " + PythonInterpreter::instance().last_error());
+    pybind11::gil_scoped_acquire gil;
+
+    pybind11::dict scope;
+    pybind11::exec("import os, sys\n"
+                   "orig = sys.__stdout__\n"
+                   "enc = sys.stdout.encoding\n"
+                   "enc_ok = isinstance(enc, str) and len(enc) > 0\n"
+                   "if orig is not None:\n"
+                   "    fd = sys.stdout.fileno()\n"
+                   "    same_fd = (fd == orig.fileno())\n"
+                   "    os.fstat(fd)\n"
+                   "    same_tty = (sys.stdout.isatty() == orig.isatty())\n"
+                   "    same_enc = (enc == orig.encoding)\n"
+                   "else:\n"
+                   "    same_fd = same_tty = same_enc = True\n"
+                   "err_enc_ok = isinstance(sys.stderr.encoding, str) and len(sys.stderr.encoding) > 0\n"
+                   "is_tee = sys.stdout is not sys.__stdout__\n",
+                   scope);
+
+    CHECK(scope["enc_ok"].cast<bool>());
+    CHECK(scope["same_fd"].cast<bool>());
+    CHECK(scope["same_tty"].cast<bool>());
+    CHECK(scope["same_enc"].cast<bool>());
+    CHECK(scope["err_enc_ok"].cast<bool>());
+    // Pins that stdout is actually the tee (otherwise the checks above are trivially true).
+    CHECK(scope["is_tee"].cast<bool>());
+}
+
+TEST_CASE("Concurrent Python stdout and stderr writes reach the log as whole lines", "[PluginLifecycle][Python]")
+{
+    ScopedPluginManager plugin_system;
+    if (!plugin_system.initialized)
+        SKIP("Bundled Python interpreter unavailable: " + PythonInterpreter::instance().last_error());
+    pybind11::gil_scoped_acquire gil;
+
+    // Each write is one complete line; a torn write would split or merge lines in the file.
+    // The GIL is released while the threads run (join blocks), so they genuinely interleave.
+    pybind11::exec("import sys, threading\n"
+                   "def work(stream, tag):\n"
+                   "    for i in range(100):\n"
+                   "        stream.write('ORCA_LINE ' + tag + ' ' + 'x' * 200 + '\\n')\n"
+                   "threads = [threading.Thread(target=work, args=(sys.stdout if n % 2 else sys.stderr, 'T%d' % n)) for n in range(4)]\n"
+                   "[t.start() for t in threads]\n"
+                   "[t.join() for t in threads]\n");
+
+    const std::string log = read_python_logs(plugin_system.python_data_dir.dir);
+    const std::string tail(200, 'x');
+    const std::string prefix = "ORCA_LINE T0 ";
+    size_t whole = 0, total = 0;
+    for (size_t start = 0; start < log.size();) {
+        size_t end = log.find('\n', start);
+        if (end == std::string::npos)
+            end = log.size();
+        const std::string line = log.substr(start, end - start);
+        start = end + 1;
+        if (line.find("ORCA_LINE") == std::string::npos)
+            continue;
+        ++total;
+        if (line.size() == prefix.size() + tail.size() && line.compare(0, 11, "ORCA_LINE T") == 0 &&
+            line.compare(prefix.size(), tail.size(), tail) == 0)
+            ++whole;
+    }
+    for (const char* t : {"T0", "T1", "T2", "T3"})
+        CHECK(count_occurrences(log, std::string("ORCA_LINE ") + t + " ") == 100);
+    CHECK(total == 400);
+    CHECK(whole == 400);
+}
