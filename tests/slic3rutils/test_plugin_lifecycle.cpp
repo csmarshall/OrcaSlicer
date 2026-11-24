@@ -325,6 +325,153 @@ PluginDescriptor descriptor_of(PluginManager& manager, const std::string& plugin
     return descriptor;
 }
 
+// Collects the completion of one Script launch. With no wx app the completion is delivered on the
+// worker thread, so it only stores data under the mutex; assertions run on the test thread.
+struct ScriptRunWatcher
+{
+    std::mutex              mutex;
+    std::condition_variable cv;
+    bool                    done = false;
+    ScriptCompletion        completion;
+
+    bool wait_done(std::chrono::seconds timeout)
+    {
+        std::unique_lock<std::mutex> lock(mutex);
+        return cv.wait_for(lock, timeout, [this] { return done; });
+    }
+};
+
+PluginManager::ScriptLaunchResult launch_script(PluginManager&                           manager,
+                                                const std::string&                       plugin_key,
+                                                const std::string&                       capability_name,
+                                                const std::shared_ptr<ScriptRunWatcher>& watcher)
+{
+    return manager.launch_script_capability(plugin_key, capability_name, [watcher](const ScriptCompletion& completion) {
+        {
+            std::lock_guard<std::mutex> lock(watcher->mutex);
+            watcher->completion = completion;
+            watcher->done       = true;
+        }
+        watcher->cv.notify_all();
+    });
+}
+
+// A script plugin appends one line per event to {events_file}. Its waits are bounded so a run that
+// is never cancelled ends on its own and a failing test stays short instead of hanging unload.
+// `body` is the capability class body; "@EVENTS@" is replaced by the events file path.
+std::string event_plugin_source(const fs::path& events_file, const std::string& body)
+{
+    std::string source = R"PY(# /// script
+# requires-python = ">=3.12"
+#
+# [tool.orcaslicer.plugin]
+# name = "Event Plugin"
+# description = "Records script run events to a file"
+# author = "tests"
+# version = "1.0"
+# type = "script"
+# ///
+import asyncio
+import threading
+import orca
+
+_stop = threading.Event()
+
+def _log(line):
+    with open("@EVENTS@", "a") as f:
+        f.write(line + "\n")
+
+class Runner(orca.script.ScriptPluginCapabilityBase):
+    def get_name(self):
+        return "Runner"
+@BODY@
+
+@orca.plugin
+class EventPackage(orca.base):
+    def register_capabilities(self):
+        orca.register_capability(Runner)
+)PY";
+    const auto replace_all = [&source](const std::string& token, const std::string& value) {
+        for (std::size_t at = source.find(token); at != std::string::npos; at = source.find(token, at + value.size()))
+            source.replace(at, token.size(), value);
+    };
+    replace_all("@BODY@", body);
+    replace_all("@EVENTS@", events_file.generic_string());
+    return source;
+}
+
+// Sync run that blocks until on_cancelled() sets the stop flag (bounded to 20 s).
+const char* const BLOCKING_SYNC_BODY = R"PY(
+    def execute(self):
+        _log("started")
+        _stop.wait(20)
+        return orca.ExecutionResult.success()
+
+    def on_cancelled(self):
+        _log("cancelled")
+        _stop.set()
+)PY";
+
+// Async run that sleeps for up to 20 s unless its task is cancelled; on_cancelled() is not defined.
+const char* const SLEEPING_ASYNC_BODY = R"PY(
+    async def execute(self):
+        _log("started")
+        await asyncio.sleep(20)
+        return orca.ExecutionResult.success()
+)PY";
+
+// Run that returns at once; on_cancelled() only records that it was told.
+const char* const QUICK_BODY = R"PY(
+    def execute(self):
+        _log("started")
+        return orca.ExecutionResult.success()
+
+    def on_cancelled(self):
+        _log("cancelled")
+)PY";
+
+// Writes the plugin and a sidecar with full access (the plugin appends to a file outside its own
+// directory), then discovers and loads it.
+bool load_event_plugin(PluginManager& manager, const ScopedDataDir& data_dir_guard, const fs::path& events_file,
+                       const std::string& body, std::string& error)
+{
+    const fs::path plugin_dir = write_plugin(data_dir_guard, "Event_Plugin", event_plugin_source(events_file, body));
+
+    PluginInstallState state;
+    state.installed_from          = "local";
+    state.installed_version       = "1.0";
+    state.plugin_name             = "Event Plugin";
+    state.permissions.full_access = true;
+    if (!write_install_state(plugin_dir, state))
+        return false;
+
+    manager.discover_plugins(/*async=*/false, /*clear=*/true);
+    return load_and_wait(manager, "Event_Plugin", error);
+}
+
+// Number of lines in the events file equal to `event`.
+int count_events(const fs::path& events_file, const std::string& event)
+{
+    std::ifstream in(events_file.string());
+    int           count = 0;
+    for (std::string line; std::getline(in, line);)
+        if (line == event)
+            ++count;
+    return count;
+}
+
+// Polls the events file from the test thread until `event` shows up or the timeout passes.
+bool wait_for_event(const fs::path& events_file, const std::string& event, std::chrono::seconds timeout)
+{
+    const auto deadline = std::chrono::steady_clock::now() + timeout;
+    while (count_events(events_file, event) == 0) {
+        if (std::chrono::steady_clock::now() >= deadline)
+            return false;
+        std::this_thread::sleep_for(std::chrono::milliseconds(10));
+    }
+    return true;
+}
+
 } // namespace
 
 TEST_CASE("Lifecycle hook shutdown drains concurrent dispatch", "[PluginLifecycle][LifecycleEvents]")
@@ -1599,3 +1746,144 @@ TEST_CASE("SSL_CERT_FILE still overrides the bundled Python's default CA certifi
     CHECK(default_context_ca_count() == 0);
 }
 #endif
+
+TEST_CASE("Disabling a running script capability calls on_cancelled and ends the run", "[PluginLifecycle][Python]")
+{
+    ScopedPluginManager plugin_system;
+    if (!plugin_system.initialized)
+        SKIP("Bundled Python interpreter unavailable: " + PythonInterpreter::instance().last_error());
+
+    ScopedDataDir  data_dir_guard("lifecycle-disable-running");
+    const fs::path events = data_dir_guard.dir / "events.txt";
+
+    PluginManager& manager = PluginManager::instance();
+    std::string    error;
+    REQUIRE(load_event_plugin(manager, data_dir_guard, events, BLOCKING_SYNC_BODY, error));
+
+    auto watcher = std::make_shared<ScriptRunWatcher>();
+    REQUIRE(launch_script(manager, "Event_Plugin", "Runner", watcher).launched_async);
+    REQUIRE(wait_for_event(events, "started", std::chrono::seconds(10)));
+
+    manager.set_capability_enabled({PluginCapabilityType::Script, "Runner", "Event_Plugin"}, false);
+
+    const bool ended = watcher->wait_done(std::chrono::seconds(10));
+    CHECK(ended);
+    CHECK(count_events(events, "cancelled") == 1);
+    {
+        std::lock_guard<std::mutex> lock(watcher->mutex);
+        CHECK(watcher->completion.cancelled);
+    }
+
+    // Unloading after the disable must not tell the plugin a second time.
+    REQUIRE(manager.unload_plugin("Event_Plugin"));
+    CHECK(count_events(events, "cancelled") == 1);
+}
+
+TEST_CASE("Disabling a running async script capability cancels its task", "[PluginLifecycle][Python]")
+{
+    ScopedPluginManager plugin_system;
+    if (!plugin_system.initialized)
+        SKIP("Bundled Python interpreter unavailable: " + PythonInterpreter::instance().last_error());
+
+    ScopedDataDir  data_dir_guard("lifecycle-disable-async");
+    const fs::path events = data_dir_guard.dir / "events.txt";
+
+    PluginManager& manager = PluginManager::instance();
+    std::string    error;
+    REQUIRE(load_event_plugin(manager, data_dir_guard, events, SLEEPING_ASYNC_BODY, error));
+
+    auto watcher = std::make_shared<ScriptRunWatcher>();
+    REQUIRE(launch_script(manager, "Event_Plugin", "Runner", watcher).launched_async);
+    REQUIRE(wait_for_event(events, "started", std::chrono::seconds(10)));
+
+    manager.set_capability_enabled({PluginCapabilityType::Script, "Runner", "Event_Plugin"}, false);
+
+    const bool ended = watcher->wait_done(std::chrono::seconds(10));
+    CHECK(ended);
+    {
+        std::lock_guard<std::mutex> lock(watcher->mutex);
+        CHECK(watcher->completion.cancelled);
+    }
+
+    REQUIRE(manager.unload_plugin("Event_Plugin"));
+}
+
+TEST_CASE("A script capability cannot be launched twice while it is running", "[PluginLifecycle][Python]")
+{
+    ScopedPluginManager plugin_system;
+    if (!plugin_system.initialized)
+        SKIP("Bundled Python interpreter unavailable: " + PythonInterpreter::instance().last_error());
+
+    ScopedDataDir  data_dir_guard("lifecycle-launch-twice");
+    const fs::path events = data_dir_guard.dir / "events.txt";
+
+    PluginManager& manager = PluginManager::instance();
+    std::string    error;
+    REQUIRE(load_event_plugin(manager, data_dir_guard, events, BLOCKING_SYNC_BODY, error));
+
+    auto first = std::make_shared<ScriptRunWatcher>();
+    REQUIRE(launch_script(manager, "Event_Plugin", "Runner", first).launched_async);
+    REQUIRE(wait_for_event(events, "started", std::chrono::seconds(10)));
+
+    auto second = std::make_shared<ScriptRunWatcher>();
+    const PluginManager::ScriptLaunchResult refused = launch_script(manager, "Event_Plugin", "Runner", second);
+    CHECK_FALSE(refused.launched_async);
+    CHECK(refused.already_running);
+    // A refusal is not a failure: the plugin stays loaded and gets no error recorded.
+    CHECK(manager.is_plugin_loaded("Event_Plugin"));
+
+    // Give a wrongly accepted second worker time to record its start.
+    std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    CHECK(count_events(events, "started") == 1);
+
+    // The enabled capability is told on unload, which releases the first run.
+    REQUIRE(manager.unload_plugin("Event_Plugin"));
+}
+
+TEST_CASE("Disabling a script capability with no run in flight still calls on_cancelled", "[PluginLifecycle][Python]")
+{
+    ScopedPluginManager plugin_system;
+    if (!plugin_system.initialized)
+        SKIP("Bundled Python interpreter unavailable: " + PythonInterpreter::instance().last_error());
+
+    ScopedDataDir  data_dir_guard("lifecycle-disable-idle");
+    const fs::path events = data_dir_guard.dir / "events.txt";
+
+    PluginManager& manager = PluginManager::instance();
+    std::string    error;
+    REQUIRE(load_event_plugin(manager, data_dir_guard, events, QUICK_BODY, error));
+
+    auto watcher = std::make_shared<ScriptRunWatcher>();
+    REQUIRE(launch_script(manager, "Event_Plugin", "Runner", watcher).launched_async);
+    REQUIRE(watcher->wait_done(std::chrono::seconds(10)));
+
+    manager.set_capability_enabled({PluginCapabilityType::Script, "Runner", "Event_Plugin"}, false);
+    CHECK(count_events(events, "cancelled") == 1);
+
+    REQUIRE(manager.unload_plugin("Event_Plugin"));
+    CHECK(count_events(events, "cancelled") == 1);
+}
+
+TEST_CASE("A script capability can be launched again after its run ended", "[PluginLifecycle][Python]")
+{
+    ScopedPluginManager plugin_system;
+    if (!plugin_system.initialized)
+        SKIP("Bundled Python interpreter unavailable: " + PythonInterpreter::instance().last_error());
+
+    ScopedDataDir  data_dir_guard("lifecycle-relaunch");
+    const fs::path events = data_dir_guard.dir / "events.txt";
+
+    PluginManager& manager = PluginManager::instance();
+    std::string    error;
+    REQUIRE(load_event_plugin(manager, data_dir_guard, events, QUICK_BODY, error));
+
+    auto first = std::make_shared<ScriptRunWatcher>();
+    REQUIRE(launch_script(manager, "Event_Plugin", "Runner", first).launched_async);
+    REQUIRE(first->wait_done(std::chrono::seconds(10)));
+
+    auto second = std::make_shared<ScriptRunWatcher>();
+    CHECK(launch_script(manager, "Event_Plugin", "Runner", second).launched_async);
+    CHECK(second->wait_done(std::chrono::seconds(10)));
+
+    REQUIRE(manager.unload_plugin("Event_Plugin"));
+}

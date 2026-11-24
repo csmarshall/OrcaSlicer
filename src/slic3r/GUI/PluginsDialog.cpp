@@ -1577,6 +1577,13 @@ void PluginsDialog::run_script_plugin_capability(const std::string& plugin_key, 
         launch = manager.launch_script_capability(plugin_key, capability_name, finish);
     }
 
+    // The capability is still running from an earlier press: say so, and leave the plugin alone (the
+    // failure path below records an error and unloads it, which would end the run in progress).
+    if (launch.already_running) {
+        show_status(wxString::Format(_L("\"%s\" is already running."), from_u8(capability_name)), "info");
+        return;
+    }
+
     // Every started invocation — a synchronous `def execute` included — completes later through
     // `finish`; only a launch failure is reported inline. Return without blocking.
     if (!launch.launched_async)

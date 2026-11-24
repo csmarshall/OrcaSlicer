@@ -195,6 +195,11 @@ struct PluginScriptAction : AppAction
             return {AppActionRunResult::Level::Info, _L("Script plugin started.")};
         }
 
+        // Still running from an earlier press: report it, without the failure path (which would
+        // record a plugin error).
+        if (launch.already_running)
+            return {AppActionRunResult::Level::Info, wxString::Format(_L("\"%s\" is already running."), from_u8(capability))};
+
         // The launch failed inline; on_done produced the (error) result.
         on_done(launch.outcome);
         return outcome->result;
